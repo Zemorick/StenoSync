@@ -124,17 +124,75 @@ def write_both(json_path, json_entries, rtf_path, rtf_entries, rtf_header=None):
 
 # ───────────────────────── GUI ─────────────────────────
 
-CONFLICT_BG = QColor(180, 60, 60)
-MISSING_J_BG = QColor(160, 130, 40)
-MISSING_R_BG = QColor(50, 100, 150)
-IGNORED_BG = QColor(80, 80, 80)
-LATER_BG = QColor(100, 70, 120)
-TEXT_COLOR = QColor(255, 255, 255)
 APP_FONT_SIZE = 13
 MAX_TABLE_ROWS = 2000  # cap visible rows — search narrows the rest
 
-PLANNING_BG = QColor(40, 100, 70)
-INCOMPLETE_BG = QColor(90, 70, 50)
+DARK_COLORS = {
+    "conflict": QColor(180, 60, 60), "missing_j": QColor(160, 130, 40),
+    "missing_r": QColor(50, 100, 150), "ignored": QColor(80, 80, 80),
+    "later": QColor(100, 70, 120), "planning": QColor(40, 100, 70),
+    "incomplete": QColor(90, 70, 50), "text": QColor(255, 255, 255),
+    "problem": QColor(255, 100, 100),
+    "hint": "#66ccff", "hint_err": "#ee6666",
+}
+LIGHT_COLORS = {
+    "conflict": QColor(255, 175, 175), "missing_j": QColor(255, 224, 150),
+    "missing_r": QColor(172, 214, 255), "ignored": QColor(214, 214, 214),
+    "later": QColor(224, 200, 240), "planning": QColor(184, 228, 204),
+    "incomplete": QColor(235, 214, 188), "text": QColor(20, 20, 20),
+    "problem": QColor(178, 24, 24),
+    "hint": "#0068a8", "hint_err": "#c22525",
+}
+COLORS = DARK_COLORS
+
+
+def apply_theme(app, theme):
+    """Apply light or dark palette to the whole app (ported from Steno Type,
+    incl. the macOS fix: Qt6's color-scheme hint keeps the title bar and
+    native widgets from overriding the palette)."""
+    global COLORS
+    COLORS = DARK_COLORS if theme == "Dark" else LIGHT_COLORS
+    hints = app.styleHints()
+    if hasattr(hints, "setColorScheme"):
+        hints.setColorScheme(Qt.ColorScheme.Dark if theme == "Dark"
+                             else Qt.ColorScheme.Light)
+    from PyQt6.QtGui import QPalette
+    p = QPalette()
+    R = QPalette.ColorRole
+    if theme == "Dark":
+        p.setColor(R.Window, QColor(43, 43, 43))
+        p.setColor(R.WindowText, QColor(220, 220, 220))
+        p.setColor(R.Base, QColor(30, 30, 30))
+        p.setColor(R.AlternateBase, QColor(50, 50, 50))
+        p.setColor(R.Text, QColor(220, 220, 220))
+        p.setColor(R.Button, QColor(53, 53, 53))
+        p.setColor(R.ButtonText, QColor(220, 220, 220))
+        p.setColor(R.BrightText, QColor(255, 255, 255))
+        p.setColor(R.Highlight, QColor(42, 130, 218))
+        p.setColor(R.HighlightedText, QColor(255, 255, 255))
+        p.setColor(R.ToolTipBase, QColor(50, 50, 50))
+        p.setColor(R.ToolTipText, QColor(220, 220, 220))
+        p.setColor(R.PlaceholderText, QColor(120, 120, 120))
+    else:
+        p.setColor(R.Window, QColor(240, 240, 240))
+        p.setColor(R.WindowText, QColor(0, 0, 0))
+        p.setColor(R.Base, QColor(255, 255, 255))
+        p.setColor(R.AlternateBase, QColor(245, 245, 245))
+        p.setColor(R.Text, QColor(0, 0, 0))
+        p.setColor(R.Button, QColor(240, 240, 240))
+        p.setColor(R.ButtonText, QColor(0, 0, 0))
+        p.setColor(R.BrightText, QColor(255, 0, 0))
+        p.setColor(R.Highlight, QColor(42, 130, 218))
+        p.setColor(R.HighlightedText, QColor(255, 255, 255))
+        p.setColor(R.ToolTipBase, QColor(255, 255, 220))
+        p.setColor(R.ToolTipText, QColor(0, 0, 0))
+        p.setColor(R.PlaceholderText, QColor(120, 120, 120))
+    app.setPalette(p)
+    # Force Qt to re-resolve palette() references in per-widget stylesheets
+    for widget in app.allWidgets():
+        ss = widget.styleSheet()
+        if ss:
+            widget.setStyleSheet(ss)
 TAGS_FILENAME = "stenosync_tags.json"
 PLANNING_FILENAME = "stenosync_planning.json"
 
@@ -225,6 +283,11 @@ class StenoSync(QMainWindow):
         font_plus.setFixedWidth(36)
         font_plus.clicked.connect(lambda: self._change_font_size(1))
         files.addWidget(font_plus)
+        self._theme = self._settings.value("theme", "Dark")
+        self.theme_btn = QPushButton()
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        self._update_theme_btn()
+        files.addWidget(self.theme_btn)
         outer.addLayout(files)
 
         # --- add-entry form ---
@@ -236,7 +299,7 @@ class StenoSync(QMainWindow):
         self.stroke_in.setPlaceholderText("e.g. STKPW")
         row1.addWidget(self.stroke_in)
         self.stroke_hint = QLabel("")
-        self.stroke_hint.setStyleSheet("color: #66ccff; font-size: 15pt; font-weight: bold;")
+        self.stroke_hint.setStyleSheet(f"color: {COLORS['hint']}; font-size: 15pt; font-weight: bold;")
         row1.addWidget(self.stroke_hint)
         self.stroke_in.textChanged.connect(self._update_stroke_hint)
         self.formatted_cb = QCheckBox("Formatted")
@@ -360,7 +423,7 @@ class StenoSync(QMainWindow):
         self.plan_stroke_in.setPlaceholderText("Stroke (optional)")
         plan_input.addWidget(self.plan_stroke_in)
         self.plan_hint = QLabel("")
-        self.plan_hint.setStyleSheet("color: #66ccff; font-size: 15pt; font-weight: bold;")
+        self.plan_hint.setStyleSheet(f"color: {COLORS['hint']}; font-size: 15pt; font-weight: bold;")
         plan_input.addWidget(self.plan_hint)
         self.plan_stroke_in.textChanged.connect(self._update_plan_hint)
         self.plan_trans_in = QLineEdit()
@@ -446,6 +509,24 @@ class StenoSync(QMainWindow):
         self.plan_table.verticalHeader().setDefaultSectionSize(row_h)
         self.font_size_label.setText(f"Font: {new_size}pt")
 
+    # ----- theme -----
+    def _update_theme_btn(self):
+        nxt = "Light" if self._theme == "Dark" else "Dark"
+        self.theme_btn.setText(("☀ " if nxt == "Light" else "🌙 ") + nxt)
+        self.theme_btn.setToolTip(f"Switch to {nxt.lower()} mode")
+
+    def _toggle_theme(self):
+        self._theme = "Light" if self._theme == "Dark" else "Dark"
+        self._settings.setValue("theme", self._theme)
+        apply_theme(QApplication.instance(), self._theme)
+        self._update_theme_btn()
+        # repaint everything that carries explicit colors
+        self.refresh_table()
+        self.refresh_sync()
+        self.refresh_planning()
+        self._update_stroke_hint()
+        self._update_plan_hint()
+
     # ----- form behavior -----
     def _toggle_formatted(self):
         formatted = self.formatted_cb.isChecked()
@@ -466,16 +547,16 @@ class StenoSync(QMainWindow):
         if jv is not None and rv is not None:
             if jv == rv:
                 self.stroke_hint.setText(f"exists: \"{jv}\"")
-                self.stroke_hint.setStyleSheet("color: #66ccff;")
+                self.stroke_hint.setStyleSheet(f"color: {COLORS['hint']};")
             else:
                 self.stroke_hint.setText(f"CONFLICT — JSON: \"{jv}\" / RTF: \"{rv}\"")
-                self.stroke_hint.setStyleSheet("color: #ee6666; font-size: 15pt; font-weight: bold;")
+                self.stroke_hint.setStyleSheet(f"color: {COLORS['hint_err']}; font-size: 15pt; font-weight: bold;")
         elif jv is not None:
             self.stroke_hint.setText(f"in JSON only: \"{jv}\"")
-            self.stroke_hint.setStyleSheet("color: #66ccff;")
+            self.stroke_hint.setStyleSheet(f"color: {COLORS['hint']};")
         elif rv is not None:
             self.stroke_hint.setText(f"in RTF only: \"{rv}\"")
-            self.stroke_hint.setStyleSheet("color: #66ccff;")
+            self.stroke_hint.setStyleSheet(f"color: {COLORS['hint']};")
         else:
             self.stroke_hint.setText("")
 
@@ -758,16 +839,16 @@ class StenoSync(QMainWindow):
         if jv is not None and rv is not None:
             if jv == rv:
                 self.plan_hint.setText(f"exists: \"{jv}\"")
-                self.plan_hint.setStyleSheet("color: #66ccff; font-size: 15pt; font-weight: bold;")
+                self.plan_hint.setStyleSheet(f"color: {COLORS['hint']}; font-size: 15pt; font-weight: bold;")
             else:
                 self.plan_hint.setText(f"CONFLICT — JSON: \"{jv}\" / RTF: \"{rv}\"")
-                self.plan_hint.setStyleSheet("color: #ee6666; font-size: 15pt; font-weight: bold;")
+                self.plan_hint.setStyleSheet(f"color: {COLORS['hint_err']}; font-size: 15pt; font-weight: bold;")
         elif jv is not None:
             self.plan_hint.setText(f"in JSON only: \"{jv}\"")
-            self.plan_hint.setStyleSheet("color: #66ccff; font-size: 15pt; font-weight: bold;")
+            self.plan_hint.setStyleSheet(f"color: {COLORS['hint']}; font-size: 15pt; font-weight: bold;")
         elif rv is not None:
             self.plan_hint.setText(f"in RTF only: \"{rv}\"")
-            self.plan_hint.setStyleSheet("color: #66ccff; font-size: 15pt; font-weight: bold;")
+            self.plan_hint.setStyleSheet(f"color: {COLORS['hint']}; font-size: 15pt; font-weight: bold;")
         else:
             self.plan_hint.setText("")
 
@@ -873,27 +954,27 @@ class StenoSync(QMainWindow):
             s = entry.get("stroke", "")
             t = entry.get("translation", "")
             if not s and not t:
-                status, bg = "empty", INCOMPLETE_BG
+                status, bg = "empty", COLORS["incomplete"]
             elif not s or not t:
-                status, bg = "incomplete", INCOMPLETE_BG
+                status, bg = "incomplete", COLORS["incomplete"]
             elif s in self.json_entries or s in self.rtf_entries:
                 ej = self.json_entries.get(s)
                 er = self.rtf_entries.get(s)
                 if ej is not None and er is not None and \
                         normalized(ej) != normalized(er):
-                    status, bg = "conflict", CONFLICT_BG
+                    status, bg = "conflict", COLORS["conflict"]
                 else:
-                    status, bg = "exists", MISSING_J_BG
+                    status, bg = "exists", COLORS["missing_j"]
             else:
-                status, bg = "ready", PLANNING_BG
+                status, bg = "ready", COLORS["planning"]
             is_problem = status in ("conflict", "exists")
             for c, val in enumerate((s, t, status)):
                 item = QTableWidgetItem(val)
                 item.setBackground(bg)
                 if is_problem:
-                    item.setForeground(QColor(255, 100, 100))
+                    item.setForeground(COLORS["problem"])
                 else:
-                    item.setForeground(TEXT_COLOR)
+                    item.setForeground(COLORS["text"])
                 # status column is read-only
                 if c == 2:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -942,8 +1023,8 @@ class StenoSync(QMainWindow):
             for c, val in enumerate((k, jv, rv)):
                 item = QTableWidgetItem(val)
                 if jv != rv:
-                    item.setBackground(CONFLICT_BG)
-                    item.setForeground(TEXT_COLOR)
+                    item.setBackground(COLORS["conflict"])
+                    item.setForeground(COLORS["text"])
                 self.table.setItem(i, c, item)
         self.table.setUpdatesEnabled(True)
 
@@ -952,9 +1033,9 @@ class StenoSync(QMainWindow):
         show_ignored = self.show_ignored_cb.isChecked()
         show_later = self.show_later_cb.isChecked()
         all_rows = (
-            [(s, "conflict: translations differ", CONFLICT_BG) for s in conf]
-            + [(s, "in JSON only — missing from RTF", MISSING_R_BG) for s in mir]
-            + [(s, "in RTF only — missing from JSON", MISSING_J_BG) for s in mij]
+            [(s, "conflict: translations differ", COLORS["conflict"]) for s in conf]
+            + [(s, "in JSON only — missing from RTF", COLORS["missing_r"]) for s in mir]
+            + [(s, "in RTF only — missing from JSON", COLORS["missing_j"]) for s in mij]
         )
         rows = []
         hidden = 0
@@ -965,9 +1046,9 @@ class StenoSync(QMainWindow):
                 hidden += 1
                 continue
             if tag == "ignore":
-                bg = IGNORED_BG
+                bg = COLORS["ignored"]
             elif tag == "later":
-                bg = LATER_BG
+                bg = COLORS["later"]
             rows.append((s, msg, tag, bg))
         shown = rows[:MAX_TABLE_ROWS]
         self.sync_table.setUpdatesEnabled(False)
@@ -976,7 +1057,7 @@ class StenoSync(QMainWindow):
             for c, val in enumerate((s, msg, tag)):
                 item = QTableWidgetItem(val)
                 item.setBackground(bg)
-                item.setForeground(TEXT_COLOR)
+                item.setForeground(COLORS["text"])
                 self.sync_table.setItem(i, c, item)
         self.sync_table.setUpdatesEnabled(True)
         total = len(all_rows)
@@ -1014,6 +1095,9 @@ class StenoSync(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    _theme = QSettings("StenoSync", "StenoSync").value("theme", "Dark")
+    apply_theme(app, _theme)
     w = StenoSync()
     w.show()
     sys.exit(app.exec())
