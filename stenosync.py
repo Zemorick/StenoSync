@@ -41,29 +41,48 @@ def serialize_plover_json(entries):
     return json.dumps(dict(sorted(entries.items())), ensure_ascii=False, indent=0)
 
 
-# CRE entries look like: {\*\cxs STKPW}word
-_ENTRY_RE = re.compile(r"\{\\\*\\cxs\s+([^}]*)\}([^{}\\]*)")
+# CRE entries look like: {\*\cxs STKPW}word — the translation may contain
+# RTF control words (\cxds ing) and braced metadata groups (entrydate etc.),
+# all of which must survive a read-write cycle untouched.
+_ENTRY_RE = re.compile(r"\{\\\*\\cxs ([^}]+)\}(.*?)(?=\{\\\*\\cxs |$)")
+_META_GROUP_RE = re.compile(r"\{\\\*\\cxsvatdict[a-z]*[^}]*\}")
 CRE_HEADER = (r"{\rtf1\ansi\ansicpg1252\deff0\deflang1033"
               r"{\fonttbl{\f0\fnil Courier New;}}"
               r"{\*\cxsystem StenoSync}\cxdict")
 
 
 def parse_cre_rtf(text):
+    """Parse a CRE RTF dictionary. Returns (entries, header).
+
+    Translations are kept RAW — control words, spacing, and metadata groups
+    intact — so serialize_cre_rtf(parse_cre_rtf(x)) is lossless per entry.
+    header is the original file preamble (before the first entry), reused on
+    write so the source system's header survives."""
+    flat = text.replace("\r", "").replace("\n", "")
+    first = flat.find(r"{\*\cxs ")
+    header = flat[:first] if first >= 0 else None
+    body = flat[:-1] if flat.endswith("}") else flat  # drop final closing brace
     entries = {}
-    for m in _ENTRY_RE.finditer(text):
+    for m in _ENTRY_RE.finditer(body):
         steno = m.group(1).strip()
-        translation = m.group(2).strip()
         if steno:
-            entries[steno] = translation
-    return entries
+            entries[steno] = m.group(2)
+    return entries, header
 
 
-def serialize_cre_rtf(entries):
-    lines = [CRE_HEADER]
+def serialize_cre_rtf(entries, header=None):
+    lines = [header or CRE_HEADER]
     for steno, translation in sorted(entries.items()):
         lines.append(r"{\*\cxs %s}%s" % (steno, translation))
     lines.append("}")
     return "\r\n".join(lines)
+
+
+def normalized(value):
+    """Comparison form of a translation: CRE metadata groups (entry dates,
+    flags) stripped and whitespace trimmed. Raw values are what get written;
+    normalized values are what get compared and displayed."""
+    return _META_GROUP_RE.sub("", value).strip()
 
 
 def diff(json_entries, rtf_entries):
@@ -71,7 +90,7 @@ def diff(json_entries, rtf_entries):
     missing_in_json = sorted(rk - jk)   # present in RTF only
     missing_in_rtf = sorted(jk - rk)    # present in JSON only
     conflicts = sorted(s for s in (jk & rk)
-                       if json_entries[s] != rtf_entries[s])
+                       if normalized(json_entries[s]) != normalized(rtf_entries[s]))
     return missing_in_json, missing_in_rtf, conflicts
 
 
@@ -91,13 +110,13 @@ def _atomic_write(path, text):
         raise
 
 
-def write_both(json_path, json_entries, rtf_path, rtf_entries):
+def write_both(json_path, json_entries, rtf_path, rtf_entries, rtf_header=None):
     """Write both files. Stage both temps first so a serialize error in one
     doesn't leave the other half-updated. The two os.replace calls are
     back-to-back; true cross-file atomicity isn't possible on a filesystem,
     but failure between them is rare and leaves both files individually valid."""
     json_text = serialize_plover_json(json_entries)
-    rtf_text = serialize_cre_rtf(rtf_entries)
+    rtf_text = serialize_cre_rtf(rtf_entries, rtf_header)
     _atomic_write(json_path, json_text)
     _atomic_write(rtf_path, rtf_text)
 
@@ -167,6 +186,7 @@ class StenoSync(QMainWindow):
         self.rtf_path = None
         self.json_entries = {}
         self.rtf_entries = {}
+        self.rtf_header = None
         self.tags = {}  # stroke -> "ignore" | "later"
         self.planning = []  # list of {"stroke": ..., "translation": ...}
 
@@ -432,6 +452,8 @@ class StenoSync(QMainWindow):
             return
         jv = self.json_entries.get(stroke)
         rv = self.rtf_entries.get(stroke)
+        jv = normalized(jv) if jv is not None else None
+        rv = normalized(rv) if rv is not None else None
         if jv is not None and rv is not None:
             if jv == rv:
                 self.stroke_hint.setText(f"exists: \"{jv}\"")
@@ -470,7 +492,7 @@ class StenoSync(QMainWindow):
             with open(self.json_path, encoding="utf-8") as f:
                 self.json_entries = parse_plover_json(f.read() or "{}")
             with open(self.rtf_path, encoding="utf-8") as f:
-                self.rtf_entries = parse_cre_rtf(f.read())
+                self.rtf_entries, self.rtf_header = parse_cre_rtf(f.read())
         except Exception as e:
             QMessageBox.critical(self, "Load error", str(e))
             return
@@ -506,7 +528,8 @@ class StenoSync(QMainWindow):
         # check for existing conflict
         existing_j = self.json_entries.get(stroke)
         existing_r = self.rtf_entries.get(stroke)
-        if existing_j is not None and existing_r is not None and existing_j != existing_r:
+        if existing_j is not None and existing_r is not None and \
+                normalized(existing_j) != normalized(existing_r):
             self._big_msg(
                 QMessageBox.Icon.Warning, "Conflict",
                 f"'{stroke}' has a conflict between JSON and RTF.\n\n"
@@ -517,7 +540,7 @@ class StenoSync(QMainWindow):
 
         # warn if overwriting an existing entry
         if existing_j is not None or existing_r is not None:
-            existing_val = existing_j or existing_r
+            existing_val = normalized(existing_j if existing_j is not None else existing_r)
             reply = self._big_msg(
                 QMessageBox.Icon.Question, "Overwrite?",
                 f"'{stroke}' already exists with translation \"{existing_val}\".\n\n"
@@ -531,7 +554,7 @@ class StenoSync(QMainWindow):
         new_json[stroke] = jv
         new_rtf[stroke] = rv
         try:
-            write_both(self.json_path, new_json, self.rtf_path, new_rtf)
+            write_both(self.json_path, new_json, self.rtf_path, new_rtf, self.rtf_header)
         except Exception as e:
             QMessageBox.critical(self, "Write failed",
                                  f"Neither file changed.\n\n{e}")
@@ -582,20 +605,24 @@ class StenoSync(QMainWindow):
         for stroke in strokes:
             jv = self.json_entries.get(stroke)
             rv = self.rtf_entries.get(stroke)
-            if jv is not None and rv is not None and jv == rv:
+            if jv is not None and rv is not None and normalized(jv) == normalized(rv):
                 continue  # already in sync
             # pick whichever side has it; for conflicts, prefer JSON
-            val = jv if jv is not None else rv
-            if val is None:
+            if jv is not None:
+                new_json[stroke] = jv
+                new_rtf[stroke] = jv
+            elif rv is not None:
+                # RTF -> JSON: metadata groups stay in the RTF, not the JSON
+                new_json[stroke] = normalized(rv)
+                new_rtf[stroke] = rv
+            else:
                 continue
-            new_json[stroke] = val
-            new_rtf[stroke] = val
             synced.append(stroke)
         if not synced:
             self.status.setText("Selected entries are already in sync.")
             return
         try:
-            write_both(self.json_path, new_json, self.rtf_path, new_rtf)
+            write_both(self.json_path, new_json, self.rtf_path, new_rtf, self.rtf_header)
         except Exception as e:
             QMessageBox.critical(self, "Write failed", str(e))
             return
@@ -638,7 +665,7 @@ class StenoSync(QMainWindow):
             new_json.pop(s, None)
             new_rtf.pop(s, None)
         try:
-            write_both(self.json_path, new_json, self.rtf_path, new_rtf)
+            write_both(self.json_path, new_json, self.rtf_path, new_rtf, self.rtf_header)
         except Exception as e:
             QMessageBox.critical(self, "Write failed", str(e))
             return
@@ -680,6 +707,8 @@ class StenoSync(QMainWindow):
             return
         jv = self.json_entries.get(stroke)
         rv = self.rtf_entries.get(stroke)
+        jv = normalized(jv) if jv is not None else None
+        rv = normalized(rv) if rv is not None else None
         if jv is not None and rv is not None:
             if jv == rv:
                 self.plan_hint.setText(f"exists: \"{jv}\"")
@@ -773,7 +802,7 @@ class StenoSync(QMainWindow):
             self.status.setText("No new entries to add.")
             return
         try:
-            write_both(self.json_path, new_json, self.rtf_path, new_rtf)
+            write_both(self.json_path, new_json, self.rtf_path, new_rtf, self.rtf_header)
         except Exception as e:
             QMessageBox.critical(self, "Write failed", str(e))
             return
@@ -801,7 +830,8 @@ class StenoSync(QMainWindow):
             elif s in self.json_entries or s in self.rtf_entries:
                 ej = self.json_entries.get(s)
                 er = self.rtf_entries.get(s)
-                if ej is not None and er is not None and ej != er:
+                if ej is not None and er is not None and \
+                        normalized(ej) != normalized(er):
                     status, bg = "conflict", CONFLICT_BG
                 else:
                     status, bg = "exists", MISSING_J_BG
@@ -845,8 +875,8 @@ class StenoSync(QMainWindow):
         keys = sorted(set(self.json_entries) | set(self.rtf_entries))
         rows = []
         for k in keys:
-            jv = self.json_entries.get(k, "")
-            rv = self.rtf_entries.get(k, "")
+            jv = normalized(self.json_entries.get(k, ""))
+            rv = normalized(self.rtf_entries.get(k, ""))
             if q and q not in k.lower() and q not in jv.lower() and q not in rv.lower():
                 continue
             rows.append((k, jv, rv))
@@ -909,9 +939,9 @@ class StenoSync(QMainWindow):
         self.stroke_in.setText(stroke)
         jv = self.json_entries.get(stroke, "")
         rv = self.rtf_entries.get(stroke, "")
-        if jv == rv:
+        if normalized(jv) == normalized(rv):
             self.formatted_cb.setChecked(False)
-            self.plain_in.setText(jv)
+            self.plain_in.setText(normalized(jv))
         else:
             self.formatted_cb.setChecked(True)
             self.json_in.setText(jv)
