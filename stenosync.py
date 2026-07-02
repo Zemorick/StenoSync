@@ -13,13 +13,14 @@ Formatted   -> separate JSON and RTF fields, authored by you (no interpretation)
 
 Run: python3 stenosync.py
 """
+import bisect
 import json
 import os
 import re
 import sys
 import tempfile
 
-from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QFileDialog, QGroupBox,
@@ -130,6 +131,7 @@ IGNORED_BG = QColor(80, 80, 80)
 LATER_BG = QColor(100, 70, 120)
 TEXT_COLOR = QColor(255, 255, 255)
 APP_FONT_SIZE = 13
+MAX_TABLE_ROWS = 2000  # cap visible rows — search narrows the rest
 
 PLANNING_BG = QColor(40, 100, 70)
 INCOMPLETE_BG = QColor(90, 70, 50)
@@ -187,6 +189,10 @@ class StenoSync(QMainWindow):
         self.json_entries = {}
         self.rtf_entries = {}
         self.rtf_header = None
+        self.json_norm = {}
+        self.rtf_norm = {}
+        self._sorted_keys = []
+        self._search_lc = {}
         self.tags = {}  # stroke -> "ignore" | "later"
         self.planning = []  # list of {"stroke": ..., "translation": ...}
 
@@ -286,8 +292,13 @@ class StenoSync(QMainWindow):
         search_row.addWidget(QLabel("Search:"))
         self.search_in = QLineEdit()
         self.search_in.setPlaceholderText("filter by stroke or translation")
-        self.search_in.textChanged.connect(self.refresh_table)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self.refresh_table)
+        self.search_in.textChanged.connect(lambda: self._search_timer.start(250))
         search_row.addWidget(self.search_in)
+        self.table_count_label = QLabel("")
+        search_row.addWidget(self.table_count_label)
         outer.addLayout(search_row)
 
         # --- split: entries table | mismatch panel ---
@@ -450,10 +461,8 @@ class StenoSync(QMainWindow):
         if not stroke:
             self.stroke_hint.setText("")
             return
-        jv = self.json_entries.get(stroke)
-        rv = self.rtf_entries.get(stroke)
-        jv = normalized(jv) if jv is not None else None
-        rv = normalized(rv) if rv is not None else None
+        jv = self.json_norm.get(stroke)
+        rv = self.rtf_norm.get(stroke)
         if jv is not None and rv is not None:
             if jv == rv:
                 self.stroke_hint.setText(f"exists: \"{jv}\"")
@@ -469,6 +478,41 @@ class StenoSync(QMainWindow):
             self.stroke_hint.setStyleSheet("color: #66ccff;")
         else:
             self.stroke_hint.setText("")
+
+    def _rebuild_norm(self):
+        """Precompute normalized translations, the sorted key list, and a
+        lowercase search blob once — doing any of this per refresh is too
+        slow at 600k entries."""
+        self.json_norm = {k: normalized(v) for k, v in self.json_entries.items()}
+        self.rtf_norm = {k: normalized(v) for k, v in self.rtf_entries.items()}
+        self._sorted_keys = sorted(set(self.json_norm) | set(self.rtf_norm))
+        self._search_lc = {
+            k: f"{k}\n{self.json_norm.get(k, '')}\n{self.rtf_norm.get(k, '')}".lower()
+            for k in self._sorted_keys}
+
+    def _entry_changed(self, stroke):
+        """Update the derived indexes for one added/updated stroke."""
+        if stroke not in self._search_lc:
+            bisect.insort(self._sorted_keys, stroke)
+        jv = self.json_entries.get(stroke)
+        rv = self.rtf_entries.get(stroke)
+        self.json_norm[stroke] = normalized(jv) if jv is not None else ""
+        self.rtf_norm[stroke] = normalized(rv) if rv is not None else ""
+        if jv is None:
+            self.json_norm.pop(stroke, None)
+        if rv is None:
+            self.rtf_norm.pop(stroke, None)
+        self._search_lc[stroke] = (f"{stroke}\n{self.json_norm.get(stroke, '')}"
+                                   f"\n{self.rtf_norm.get(stroke, '')}").lower()
+
+    def _entry_removed(self, stroke):
+        self.json_norm.pop(stroke, None)
+        self.rtf_norm.pop(stroke, None)
+        if stroke in self._search_lc:
+            del self._search_lc[stroke]
+            i = bisect.bisect_left(self._sorted_keys, stroke)
+            if i < len(self._sorted_keys) and self._sorted_keys[i] == stroke:
+                self._sorted_keys.pop(i)
 
     # ----- file ops -----
     def open_pair(self):
@@ -496,6 +540,7 @@ class StenoSync(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Load error", str(e))
             return
+        self._rebuild_norm()
         self.tags = load_tags(self.json_path)
         self.planning = load_planning(self.json_path)
         self.json_label.setText("JSON: " + os.path.basename(self.json_path))
@@ -560,6 +605,7 @@ class StenoSync(QMainWindow):
                                  f"Neither file changed.\n\n{e}")
             return
         self.json_entries, self.rtf_entries = new_json, new_rtf
+        self._entry_changed(stroke)
         self.stroke_in.clear()
         self.plain_in.clear()
         self.json_in.clear()
@@ -628,6 +674,7 @@ class StenoSync(QMainWindow):
             return
         self.json_entries, self.rtf_entries = new_json, new_rtf
         for s in synced:
+            self._entry_changed(s)
             self.tags.pop(s, None)
         save_tags(self.json_path, self.tags)
         self.status.setText(f"Synced {len(synced)} entry(s) to both files.")
@@ -671,6 +718,7 @@ class StenoSync(QMainWindow):
             return
         self.json_entries, self.rtf_entries = new_json, new_rtf
         for s in strokes:
+            self._entry_removed(s)
             self.tags.pop(s, None)
         save_tags(self.json_path, self.tags)
         self.stroke_in.clear()
@@ -705,10 +753,8 @@ class StenoSync(QMainWindow):
         if not stroke:
             self.plan_hint.setText("")
             return
-        jv = self.json_entries.get(stroke)
-        rv = self.rtf_entries.get(stroke)
-        jv = normalized(jv) if jv is not None else None
-        rv = normalized(rv) if rv is not None else None
+        jv = self.json_norm.get(stroke)
+        rv = self.rtf_norm.get(stroke)
         if jv is not None and rv is not None:
             if jv == rv:
                 self.plan_hint.setText(f"exists: \"{jv}\"")
@@ -807,6 +853,9 @@ class StenoSync(QMainWindow):
             QMessageBox.critical(self, "Write failed", str(e))
             return
         self.json_entries, self.rtf_entries = new_json, new_rtf
+        for _, s, t in ready:
+            if s not in conflicts:
+                self._entry_changed(s)
         # remove committed entries from plan (reverse order to keep indices valid)
         committed_rows = sorted([r for r, s, t in ready if s not in conflicts], reverse=True)
         for r in committed_rows:
@@ -872,14 +921,22 @@ class StenoSync(QMainWindow):
     # ----- views -----
     def refresh_table(self):
         q = self.search_in.text().strip().lower()
-        keys = sorted(set(self.json_entries) | set(self.rtf_entries))
         rows = []
-        for k in keys:
-            jv = normalized(self.json_entries.get(k, ""))
-            rv = normalized(self.rtf_entries.get(k, ""))
-            if q and q not in k.lower() and q not in jv.lower() and q not in rv.lower():
+        matches = 0
+        blob = self._search_lc
+        for k in self._sorted_keys:
+            if q and q not in blob[k]:
                 continue
-            rows.append((k, jv, rv))
+            matches += 1
+            if len(rows) <= MAX_TABLE_ROWS:
+                rows.append((k, self.json_norm.get(k, ""), self.rtf_norm.get(k, "")))
+        rows = rows[:MAX_TABLE_ROWS]
+        if matches > len(rows):
+            self.table_count_label.setText(
+                f"showing {len(rows):,} of {matches:,} — search to narrow")
+        else:
+            self.table_count_label.setText(f"{matches:,} entries")
+        self.table.setUpdatesEnabled(False)
         self.table.setRowCount(len(rows))
         for i, (k, jv, rv) in enumerate(rows):
             for c, val in enumerate((k, jv, rv)):
@@ -888,9 +945,10 @@ class StenoSync(QMainWindow):
                     item.setBackground(CONFLICT_BG)
                     item.setForeground(TEXT_COLOR)
                 self.table.setItem(i, c, item)
+        self.table.setUpdatesEnabled(True)
 
     def refresh_sync(self):
-        mij, mir, conf = diff(self.json_entries, self.rtf_entries)
+        mij, mir, conf = diff(self.json_norm, self.rtf_norm)
         show_ignored = self.show_ignored_cb.isChecked()
         show_later = self.show_later_cb.isChecked()
         all_rows = (
@@ -911,21 +969,27 @@ class StenoSync(QMainWindow):
             elif tag == "later":
                 bg = LATER_BG
             rows.append((s, msg, tag, bg))
-        self.sync_table.setRowCount(len(rows))
-        for i, (s, msg, tag, bg) in enumerate(rows):
+        shown = rows[:MAX_TABLE_ROWS]
+        self.sync_table.setUpdatesEnabled(False)
+        self.sync_table.setRowCount(len(shown))
+        for i, (s, msg, tag, bg) in enumerate(shown):
             for c, val in enumerate((s, msg, tag)):
                 item = QTableWidgetItem(val)
                 item.setBackground(bg)
                 item.setForeground(TEXT_COLOR)
                 self.sync_table.setItem(i, c, item)
+        self.sync_table.setUpdatesEnabled(True)
         total = len(all_rows)
         active = total - hidden
         if total == 0:
             self.status.setText("In sync.")
         elif hidden:
-            self.status.setText(f"{active} out of sync ({hidden} hidden).")
+            self.status.setText(f"{active:,} out of sync ({hidden:,} hidden).")
         else:
-            self.status.setText(f"{active} entries out of sync.")
+            self.status.setText(f"{active:,} entries out of sync.")
+        if len(rows) > MAX_TABLE_ROWS:
+            self.status.setText(self.status.text()
+                                + f" Showing first {MAX_TABLE_ROWS:,}.")
 
     def _load_from_table(self, row, _col):
         if len(self.table.selectionModel().selectedRows()) <= 1:
