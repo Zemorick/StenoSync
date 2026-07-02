@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+stenosync_tags.json
+stenosync_planning.json
+test.json
+test.rtf
