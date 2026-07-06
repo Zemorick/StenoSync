@@ -20,7 +20,7 @@ import re
 import sys
 import tempfile
 
-from PyQt6.QtCore import Qt, QSettings, QTimer
+from PyQt6.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QFileDialog, QGroupBox,
@@ -233,6 +233,209 @@ def save_planning(json_path, planning):
     _atomic_write(_planning_path(json_path), json.dumps(planning, indent=1))
 
 
+# ───────────────────────── stroke suggestion ─────────────────────────
+# Learns suffix rules from the dictionary itself (no theory hard-coded):
+# for every root/derived pair like test=T-EFT / testing=T-EFGT, record the
+# stroke transformation, then rank rules for a new translation by how often
+# they applied to roots with the same final chord (and, via cmudict.dict if
+# present, the same final sound).
+
+_WORD_RE = re.compile(r"^[A-Za-z][a-z'-]*$")
+_LEFT_ORDER = "STKPWHRAO*"
+_RIGHT_ORDER = "EUFRPBLGTSDZ"
+_SUFFIXES = ["ing", "ed", "s", "es", "er", "ers", "est", "ly", "tion",
+             "tions", "ment", "ments", "ness", "able", "al", "ally", "ive",
+             "ity", "ies", "ied", "ier", "iest", "ful", "less", "ous",
+             "ance", "ence", "ism", "ist", "ists", "ized", "ize", "y",
+             "en", "or", "age"]
+CMUDICT_FILENAME = "cmudict.dict"
+
+
+def _chord_keys(chord):
+    """Chord -> (ok, frozenset of positional keys 'L:T' / 'R:G')."""
+    left, _, right = chord.partition("-")
+    keys = set()
+    for ch in left:
+        if ch not in _LEFT_ORDER:
+            return False, frozenset()
+        keys.add("L:" + ch)
+    for ch in right:
+        if ch not in _RIGHT_ORDER:
+            return False, frozenset()
+        keys.add("R:" + ch)
+    return True, frozenset(keys)
+
+
+def _keys_to_chord(keys):
+    left = "".join(c for c in _LEFT_ORDER if "L:" + c in keys)
+    right = "".join(c for c in _RIGHT_ORDER if "R:" + c in keys)
+    return left + "-" + right
+
+
+def _extract_rule(rstroke, dstroke):
+    """What transformation turns the root stroke into the derived stroke?"""
+    if dstroke.startswith(rstroke + "/"):
+        return ("append", dstroke[len(rstroke) + 1:])
+    rc, dc = rstroke.split("/"), dstroke.split("/")
+    if len(rc) == len(dc) and rc[:-1] == dc[:-1] and rc[-1] != dc[-1]:
+        ok1, k1 = _chord_keys(rc[-1])
+        ok2, k2 = _chord_keys(dc[-1])
+        if ok1 and ok2 and k1 < k2:
+            return ("addkeys", tuple(sorted(k2 - k1)))
+        return ("replace_last", rc[-1], dc[-1])
+    return None
+
+
+def _apply_rule(stroke, rule):
+    if rule[0] == "append":
+        return stroke + "/" + rule[1]
+    if rule[0] == "addkeys":
+        chords = stroke.split("/")
+        ok, keys = _chord_keys(chords[-1])
+        if not ok or set(rule[1]) & keys:
+            return None  # key already occupied -> rule not applicable
+        chords[-1] = _keys_to_chord(keys | set(rule[1]))
+        return "/".join(chords)
+    if rule[0] == "replace_last":
+        chords = stroke.split("/")
+        if chords[-1] != rule[1]:
+            return None
+        chords[-1] = rule[2]
+        return "/".join(chords)
+    return None
+
+
+def _rule_desc(rule):
+    if rule[0] == "append":
+        return "add stroke /" + rule[1]
+    if rule[0] == "addkeys":
+        keys = "+".join(("-" + k[2:]) if k.startswith("R:") else k[2:]
+                        for k in rule[1])
+        return "tuck " + keys
+    return f"replace {rule[1]} with {rule[2]}"
+
+
+def _candidate_roots(word, suf):
+    """Possible root spellings for word = root (+ spelling change) + suf."""
+    stem = word[:-len(suf)]
+    if not stem:
+        return []
+    cands = [stem]                        # test -> testing
+    if suf[0] in "aeiouy":
+        cands.append(stem + "e")          # make -> making
+    if len(stem) >= 2 and stem[-1] == stem[-2]:
+        cands.append(stem[:-1])           # run -> running
+    if stem.endswith("i"):
+        cands.append(stem[:-1] + "y")     # try -> tried
+    return cands
+
+
+def _load_cmudict():
+    """word -> final phoneme, from cmudict.dict next to this script
+    (optional — suggestions work without it, ranked slightly worse)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        CMUDICT_FILENAME)
+    final = {}
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2 and "(" not in parts[0]:
+                    final[parts[0]] = parts[-1].rstrip("012")
+    return final
+
+
+class StrokeSuggester:
+    """Mined suffix rules + reverse index. build() is CPU-heavy (tens of
+    seconds on a 600k dictionary) and runs off the GUI thread; suggest()
+    is per-keystroke cheap."""
+
+    def __init__(self):
+        self.words = {}        # translation -> set of strokes
+        self.rules = {}        # suffix -> {rule: count}
+        self.rules_cond = {}   # (suffix, root's last chord) -> {rule: count}
+        self.rules_phon = {}   # (suffix, root's final phoneme) -> {rule: count}
+        self.phon = {}
+        self.pair_count = 0
+        self.ready = False
+
+    def build(self, norm_maps):
+        """norm_maps: stroke -> normalized-translation dicts (JSON and RTF
+        sides). Phrases and formatted entries are filtered out, which also
+        keeps merged-in phrasing systems (multi-word translations) out of
+        the pattern mining."""
+        words = {}
+        for m in norm_maps:
+            for stroke, t in m.items():
+                if "\\" not in t and _WORD_RE.match(t):
+                    words.setdefault(t.lower(), set()).add(stroke)
+        self.words = words
+        self.phon = _load_cmudict()
+        from collections import Counter, defaultdict
+        rules = defaultdict(Counter)
+        rules_cond = defaultdict(Counter)
+        rules_phon = defaultdict(Counter)
+        npairs = 0
+        for d in words:
+            for suf in _SUFFIXES:
+                if not (d.endswith(suf) and len(d) > len(suf)):
+                    continue
+                root = next((r for r in _candidate_roots(d, suf)
+                             if r in words and r != d), None)
+                if not root:
+                    continue
+                npairs += 1
+                fp = self.phon.get(root)
+                for rs in words[root]:
+                    last = rs.split("/")[-1]
+                    for ds in words[d]:
+                        rule = _extract_rule(rs, ds)
+                        if rule:
+                            rules[suf][rule] += 1
+                            rules_cond[(suf, last)][rule] += 1
+                            if fp:
+                                rules_phon[(suf, fp)][rule] += 1
+        self.rules = dict(rules)
+        self.rules_cond = dict(rules_cond)
+        self.rules_phon = dict(rules_phon)
+        self.pair_count = npairs
+        self.ready = True
+        return self
+
+    def suggest(self, text, limit=3):
+        """Top suggestions for a translation. Returns [(stroke, evidence)]."""
+        t = text.strip().lower()
+        if not self.ready or not t or not _WORD_RE.match(t):
+            return []
+        best = {}  # stroke -> (score, evidence)
+        for suf in _SUFFIXES:
+            if not (t.endswith(suf) and len(t) > len(suf)):
+                continue
+            global_rules = self.rules.get(suf)
+            if not global_rules:
+                continue
+            for root in _candidate_roots(t, suf):
+                if root not in self.words or root == t:
+                    continue
+                fp = self.phon.get(root)
+                pcond = self.rules_phon.get((suf, fp), {}) if fp else {}
+                for rs in sorted(self.words[root],
+                                 key=lambda s: (s.count("/"), len(s)))[:4]:
+                    cond = self.rules_cond.get((suf, rs.split("/")[-1]), {})
+                    for rule, g in global_rules.items():
+                        score = (1_000_000 * cond.get(rule, 0)
+                                 + 1000 * pcond.get(rule, 0) + g)
+                        pred = _apply_rule(rs, rule)
+                        if not pred:
+                            continue
+                        if pred not in best or best[pred][0] < score:
+                            n = cond.get(rule, 0) or g
+                            best[pred] = (score, f"{root} = {rs}  ·  "
+                                          f"{_rule_desc(rule)} (seen {n:,}×)")
+        ranked = sorted(best.items(), key=lambda kv: -kv[1][0])[:limit]
+        return [(stroke, ev) for stroke, (_, ev) in ranked]
+
+
 def _parse_data_bundle(data):
     """Validate an imported data file. Accepts the export bundle
     ({"tags": ..., "planning": ...}) as well as a bare tags file (dict of
@@ -262,6 +465,17 @@ def _parse_data_bundle(data):
     return tags, planning
 
 
+class _SuggestBuilder(QThread):
+    done = pyqtSignal(object)
+
+    def __init__(self, norm_maps, parent=None):
+        super().__init__(parent)
+        self._norm_maps = norm_maps
+
+    def run(self):
+        self.done.emit(StrokeSuggester().build(self._norm_maps))
+
+
 class StenoSync(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -282,6 +496,9 @@ class StenoSync(QMainWindow):
         self._search_lc = {}
         self.tags = {}  # stroke -> "ignore" | "later"
         self.planning = []  # list of {"stroke": ..., "translation": ...}
+        self._suggester = None
+        self._suggest_thread = None
+        self._suggest_gen = 0  # invalidates in-flight builds on reload
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -454,6 +671,14 @@ class StenoSync(QMainWindow):
         plan_header = QHBoxLayout()
         plan_header.addWidget(QLabel("Planning"))
         plan_header.addStretch()
+        self.suggest_cb = QCheckBox("Suggest strokes")
+        self.suggest_cb.setToolTip(
+            "Suggest strokes for the translation you type, based on "
+            "suffix patterns mined from your own dictionary")
+        self.suggest_cb.setChecked(
+            self._settings.value("suggest_strokes", "false") == "true")
+        self.suggest_cb.stateChanged.connect(self._toggle_suggest)
+        plan_header.addWidget(self.suggest_cb)
         ppl.addLayout(plan_header)
 
         plan_input = QHBoxLayout()
@@ -471,6 +696,22 @@ class StenoSync(QMainWindow):
         plan_add_btn.clicked.connect(self.add_to_plan)
         plan_input.addWidget(plan_add_btn)
         ppl.addLayout(plan_input)
+
+        suggest_row = QHBoxLayout()
+        self.suggest_label = QLabel("")
+        suggest_row.addWidget(self.suggest_label)
+        self.suggest_btns = []
+        for _ in range(3):
+            b = QPushButton("")
+            b.setVisible(False)
+            b.clicked.connect(
+                lambda checked=False, btn=b:
+                self.plan_stroke_in.setText(btn.text()))
+            self.suggest_btns.append(b)
+            suggest_row.addWidget(b)
+        suggest_row.addStretch()
+        ppl.addLayout(suggest_row)
+        self.plan_trans_in.textChanged.connect(self._update_suggestions)
 
         self.plan_table = QTableWidget(0, 3)
         self.plan_table.setHorizontalHeaderLabels(["Stroke", "Translation", "Status"])
@@ -667,6 +908,12 @@ class StenoSync(QMainWindow):
         self.refresh_table()
         self.refresh_sync()
         self.refresh_planning()
+        self._suggester = None  # entries changed — patterns must be re-mined
+        self._suggest_gen += 1  # discard any in-flight build of the old data
+        if self.suggest_cb.isChecked():
+            self._start_suggest_build()
+        else:
+            self._update_suggestions()
 
     def add_entry(self):
         if not (self.json_path and self.rtf_path):
@@ -939,6 +1186,61 @@ class StenoSync(QMainWindow):
         self.status.setText(
             f"Imported data — now {len(self.tags):,} tag(s) and "
             f"{len(self.planning):,} planning entry(s).")
+
+    # ----- stroke suggestions -----
+    def _toggle_suggest(self):
+        on = self.suggest_cb.isChecked()
+        self._settings.setValue("suggest_strokes", "true" if on else "false")
+        if on and self._suggester is None:
+            self._start_suggest_build()
+        self._update_suggestions()
+
+    def _start_suggest_build(self):
+        if not (self.json_path and self.rtf_path):
+            return
+        self._suggest_gen += 1
+        gen = self._suggest_gen
+        self.suggest_label.setText("mining patterns…")
+        # a build already in flight keeps running; its result is discarded
+        # in _suggest_ready because its generation is stale
+        thread = _SuggestBuilder(
+            [dict(self.json_norm), dict(self.rtf_norm)], self)
+        thread.done.connect(lambda s, g=gen: self._suggest_ready(s, g))
+        self._suggest_thread = thread
+        thread.start()
+
+    def _suggest_ready(self, suggester, gen):
+        if gen != self._suggest_gen:
+            return  # entries changed while mining — a newer build is running
+        self._suggester = suggester
+        self.status.setText(
+            f"Stroke suggestions ready — learned from "
+            f"{suggester.pair_count:,} root/derived pairs.")
+        self._update_suggestions()
+
+    def _update_suggestions(self):
+        text = self.plan_trans_in.text().strip()
+        sugs = []
+        if self.suggest_cb.isChecked():
+            if self._suggester is None:
+                self.suggest_label.setText(
+                    "mining patterns…" if self._suggest_thread
+                    and self._suggest_thread.isRunning() else "")
+            elif text:
+                sugs = self._suggester.suggest(text)
+                self.suggest_label.setText(
+                    "Suggest:" if sugs else "no suggestion")
+            else:
+                self.suggest_label.setText("")
+        else:
+            self.suggest_label.setText("")
+        for btn, sug in zip(self.suggest_btns, sugs + [None] * 3):
+            if sug:
+                btn.setText(sug[0])
+                btn.setToolTip(sug[1])
+                btn.setVisible(True)
+            else:
+                btn.setVisible(False)
 
     # ----- planning -----
     def _update_plan_hint(self):
