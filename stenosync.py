@@ -233,6 +233,35 @@ def save_planning(json_path, planning):
     _atomic_write(_planning_path(json_path), json.dumps(planning, indent=1))
 
 
+def _parse_data_bundle(data):
+    """Validate an imported data file. Accepts the export bundle
+    ({"tags": ..., "planning": ...}) as well as a bare tags file (dict of
+    stroke -> tag) or bare planning file (list of entries), so the sidecar
+    files themselves can be imported directly. Returns (tags, planning)."""
+    if isinstance(data, list):
+        data = {"planning": data}
+    elif isinstance(data, dict) and "tags" not in data and "planning" not in data:
+        data = {"tags": data}
+    if not isinstance(data, dict):
+        raise ValueError("Expected a StenoSync data file")
+    tags_in = data.get("tags", {})
+    planning_in = data.get("planning", [])
+    if not isinstance(tags_in, dict) or not isinstance(planning_in, list):
+        raise ValueError("Expected a StenoSync data file")
+    tags = {}
+    for k, v in tags_in.items():
+        if v not in ("ignore", "later"):
+            raise ValueError(f"Unknown tag {v!r} for stroke {k!r}")
+        tags[str(k)] = v
+    planning = []
+    for p in planning_in:
+        if not isinstance(p, dict):
+            raise ValueError("Planning entries must be objects")
+        planning.append({"stroke": str(p.get("stroke", "")),
+                         "translation": str(p.get("translation", ""))})
+    return tags, planning
+
+
 class StenoSync(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -266,8 +295,17 @@ class StenoSync(QMainWindow):
         open_btn.clicked.connect(self.open_pair)
         reload_btn = QPushButton("Reload && re-diff")
         reload_btn.clicked.connect(self.reload)
+        export_btn = QPushButton("Export data…")
+        export_btn.setToolTip("Save tags (ignored / consider later) and the "
+                              "planning list to a single file")
+        export_btn.clicked.connect(self.export_data)
+        import_btn = QPushButton("Import data…")
+        import_btn.setToolTip("Load tags and planning from an exported file")
+        import_btn.clicked.connect(self.import_data)
         files.addWidget(open_btn)
         files.addWidget(reload_btn)
+        files.addWidget(export_btn)
+        files.addWidget(import_btn)
         files.addStretch()
         files.addWidget(self.json_label)
         files.addWidget(QLabel("  |  "))
@@ -828,6 +866,80 @@ class StenoSync(QMainWindow):
         self.status.setText(f"Tagged {len(strokes)} entry(s) as {label}.")
         self.refresh_sync()
 
+    # ----- import / export of sidecar data -----
+    def export_data(self):
+        if not self.json_path:
+            QMessageBox.warning(self, "No files", "Open a dictionary pair first.")
+            return
+        if not self.tags and not self.planning:
+            QMessageBox.information(self, "Nothing to export",
+                                    "There are no tags or planning entries yet.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export StenoSync data", "stenosync_data.json",
+            "JSON (*.json);;All (*)")
+        if not path:
+            return
+        bundle = {"app": "StenoSync", "version": 1,
+                  "tags": self.tags, "planning": self.planning}
+        try:
+            _atomic_write(path, json.dumps(bundle, ensure_ascii=False, indent=1))
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+            return
+        self.status.setText(
+            f"Exported {len(self.tags):,} tag(s) and "
+            f"{len(self.planning):,} planning entry(s) to "
+            f"{os.path.basename(path)}.")
+
+    def import_data(self):
+        if not self.json_path:
+            QMessageBox.warning(self, "No files", "Open a dictionary pair first.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import StenoSync data", "", "JSON (*.json);;All (*)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                bundle = json.loads(f.read() or "{}")
+            tags, planning = _parse_data_bundle(bundle)
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed",
+                                 f"Could not read that file.\n\n{e}")
+            return
+        if not tags and not planning:
+            QMessageBox.information(self, "Nothing to import",
+                                    "That file contains no tags or planning entries.")
+            return
+        reply = self._big_msg(
+            QMessageBox.Icon.Question, "Import data",
+            f"Import {len(tags):,} tag(s) and {len(planning):,} planning "
+            "entry(s)?\n\nYes — merge into current data "
+            "(imported tags win on overlap)\n"
+            "No — replace current data entirely",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel)
+        if reply == QMessageBox.StandardButton.Cancel:
+            return
+        if reply == QMessageBox.StandardButton.Yes:
+            self.tags.update(tags)
+            existing = {(p.get("stroke", ""), p.get("translation", ""))
+                        for p in self.planning}
+            self.planning.extend(
+                p for p in planning
+                if (p["stroke"], p["translation"]) not in existing)
+        else:
+            self.tags = tags
+            self.planning = planning
+        save_tags(self.json_path, self.tags)
+        save_planning(self.json_path, self.planning)
+        self.refresh_sync()
+        self.refresh_planning()
+        self.status.setText(
+            f"Imported data — now {len(self.tags):,} tag(s) and "
+            f"{len(self.planning):,} planning entry(s).")
+
     # ----- planning -----
     def _update_plan_hint(self):
         stroke = self.plan_stroke_in.text().strip()
@@ -904,6 +1016,21 @@ class StenoSync(QMainWindow):
             return
         if not ready:
             return
+        # same stroke twice in the selection with different translations —
+        # committing would silently let the later row win
+        by_stroke = {}
+        dups = set()
+        for _, s, t in ready:
+            if s in by_stroke and by_stroke[s] != t:
+                dups.add(s)
+            by_stroke[s] = t
+        if dups:
+            self._big_msg(
+                QMessageBox.Icon.Warning, "Duplicate strokes in plan",
+                "These strokes appear more than once in the selection with "
+                "different translations:\n\n" + "\n".join(sorted(dups)[:15]) +
+                "\n\nRemove or edit the extras before adding to dictionary.")
+            return
         new_json = dict(self.json_entries)
         new_rtf = dict(self.rtf_entries)
         conflicts = []
@@ -950,6 +1077,15 @@ class StenoSync(QMainWindow):
     def refresh_planning(self):
         self.plan_table.blockSignals(True)
         self.plan_table.setRowCount(len(self.planning))
+        # strokes that appear in more than one plan row with differing translations
+        seen = {}
+        dup_strokes = set()
+        for entry in self.planning:
+            s, t = entry.get("stroke", ""), entry.get("translation", "")
+            if s:
+                if s in seen and seen[s] != t:
+                    dup_strokes.add(s)
+                seen[s] = t
         for i, entry in enumerate(self.planning):
             s = entry.get("stroke", "")
             t = entry.get("translation", "")
@@ -957,6 +1093,8 @@ class StenoSync(QMainWindow):
                 status, bg = "empty", COLORS["incomplete"]
             elif not s or not t:
                 status, bg = "incomplete", COLORS["incomplete"]
+            elif s in dup_strokes:
+                status, bg = "dup in plan", COLORS["conflict"]
             elif s in self.json_entries or s in self.rtf_entries:
                 ej = self.json_entries.get(s)
                 er = self.rtf_entries.get(s)
@@ -967,7 +1105,7 @@ class StenoSync(QMainWindow):
                     status, bg = "exists", COLORS["missing_j"]
             else:
                 status, bg = "ready", COLORS["planning"]
-            is_problem = status in ("conflict", "exists")
+            is_problem = status in ("conflict", "exists", "dup in plan")
             for c, val in enumerate((s, t, status)):
                 item = QTableWidgetItem(val)
                 item.setBackground(bg)
